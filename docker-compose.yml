@@ -1,0 +1,24 @@
+services:
+  changeover:
+    build: .
+    image: changeover-release:latest
+    container_name: changeover-release
+    ports:
+      - "8080:8080"
+    environment:
+      # 首次初始化空库时写入演示数据（参考原料批号 + 示例产线 L1）
+      SEED_DEMO_DATA: "1"
+      DB_PATH: /data/changeover.db
+      HOST: 0.0.0.0
+      PORT: "8080"
+    volumes:
+      - changeover-data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/health').status==200 else 1)"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+volumes:
+  changeover-data:
