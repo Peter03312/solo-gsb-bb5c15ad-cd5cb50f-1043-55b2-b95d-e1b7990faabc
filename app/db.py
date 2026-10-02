@@ -196,6 +196,42 @@ CREATE TABLE IF NOT EXISTS verification_confirmation_batch (
 
 CREATE INDEX IF NOT EXISTS idx_vcb_confirmation
     ON verification_confirmation_batch(confirmation_id);
+
+-- 装车交接（整单发运）：一次交接登记一张“仍为已确认且修订号匹配”的核验单。
+-- 交接记录只追加、不可改：单据后续更正/待复核/清单修订均不改写交接记录。
+CREATE TABLE IF NOT EXISTS shipment_handover (
+    handover_no           TEXT PRIMARY KEY,           -- 唯一交接号
+    verification_no       TEXT NOT NULL REFERENCES verification(verification_no),
+    confirmation_id       INTEGER NOT NULL REFERENCES verification_confirmation(id), -- 最近一次确认
+    verification_revision INTEGER NOT NULL,           -- 交接时冻结的单据修订号（读取时修订号）
+    handed_over_at        TEXT NOT NULL               -- 交接时间（冻结）
+);
+
+CREATE INDEX IF NOT EXISTS idx_handover_verification
+    ON shipment_handover(verification_no);
+
+-- 交接逐批冻结快照：复制最近一次确认时的逐批裁决/出货资格快照。
+-- batch_no 全局唯一：任一批次已在其他交接记录中发运，整单拒绝（DB 层兜底占用唯一）。
+CREATE TABLE IF NOT EXISTS shipment_handover_batch (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    handover_no          TEXT NOT NULL REFERENCES shipment_handover(handover_no),
+    verification_no      TEXT NOT NULL REFERENCES verification(verification_no),
+    position             INTEGER NOT NULL,            -- 按确认清单顺序保序
+    batch_no             TEXT NOT NULL,
+    snapshot_version     INTEGER NOT NULL,
+    snapshot_disposition TEXT NOT NULL,               -- RELEASE / HOLD
+    snapshot_actual      TEXT NOT NULL DEFAULT '[]',
+    snapshot_undeclared  TEXT NOT NULL DEFAULT '[]',
+    snapshot_reasons     TEXT NOT NULL DEFAULT '[]',
+    snapshot_ship_version INTEGER,                    -- 出货资格版本
+    snapshot_ship_status  TEXT,                       -- SHIPPABLE / BLOCKED
+    snapshot_locked_lots  TEXT NOT NULL DEFAULT '[]',
+    snapshot_ship_reasons TEXT NOT NULL DEFAULT '[]',
+    UNIQUE(batch_no)
+);
+
+CREATE INDEX IF NOT EXISTS idx_hbatch_handover
+    ON shipment_handover_batch(handover_no, position);
 """
 
 # 初始化空库时写入的参考原料批号（不影响裁决的演示样例）

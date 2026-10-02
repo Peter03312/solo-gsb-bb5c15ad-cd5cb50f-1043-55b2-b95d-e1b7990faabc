@@ -13,6 +13,7 @@ from .schemas import (
     BatchReassignIn,
     BatchVoidIn,
     CleaningCorrection,
+    HandoverIn,
     LotLockIn,
     MaterialLotCorrection,
     MaterialLotIn,
@@ -243,6 +244,40 @@ def create_app(db_path: str | None = None, seed_demo: bool | None = None) -> Fas
         不符时返回 422 与不符批次明细（STALE_SNAPSHOT / BATCH_ON_HOLD），单据保持未确认。
         """
         return service.confirm_verification(verification_no)
+
+    # ---------------- 装车交接（整单发运） ----------------
+
+    @app.post("/api/handovers", tags=["装车交接"], status_code=201)
+    def create_handover(body: HandoverIn, service: Service = Depends(svc)):
+        """仓库完成装车交接：凭唯一交接号、已确认核验单号及读取时修订号登记整单发运。
+
+        只能交接仍为 CONFIRMED 且修订号匹配的单据；逐批须有效、当前裁决/出货资格
+        版本与最近一次确认快照一致，结论分别为 RELEASE / SHIPPABLE；任一批次已在
+        其他交接记录中发运即整单拒绝。单事务占用全单批次并冻结单号、修订号、逐批
+        确认快照与交接时间；重复交接号、未知单据、状态/版本冲突、任一不合格批次
+        均整体拒绝，不留下部分占用。交接不改写单据，其后更正/待复核/清单修订不影响
+        交接记录。
+        """
+        return service.create_handover(
+            body.handover_no, body.verification_no, body.expected_revision
+        )
+
+    @app.get("/api/handovers", tags=["装车交接"])
+    def list_handovers(
+        verification_no: str | None = None, service: Service = Depends(svc)
+    ):
+        """列出装车交接记录（可按核验单号过滤）。"""
+        return service.list_handovers(verification_no)
+
+    @app.get("/api/handovers/{handover_no}", tags=["装车交接"])
+    def get_handover(handover_no: str, service: Service = Depends(svc)):
+        """查询单张装车交接记录（冻结的单号、修订号、逐批确认快照与交接时间）。"""
+        return service.get_handover(handover_no)
+
+    @app.get("/api/batches/{batch_no}/handover", tags=["装车交接"])
+    def get_batch_handover(batch_no: str, service: Service = Depends(svc)):
+        """查询批次的装车交接归属（已发运回显交接记录，否则 handover=null）。"""
+        return service.get_batch_handover(batch_no)
 
     return app
 
