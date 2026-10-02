@@ -1899,6 +1899,365 @@ class Service:
             ).fetchone()
             return _verification_payload(conn, row)
 
+    # ------------------------------------------------------------ 装车交接
+
+    def create_handover(
+        self, handover_no: str, verification_no: str, expected_revision: int
+    ) -> dict[str, Any]:
+        """装车交接：凭唯一交接号、已确认核验单号及读取时修订号登记整单发运。
+
+        交接只接受“仍为 CONFIRMED 且修订号匹配”的单据；单内每个批次须有效（ACTIVE），
+        且当前裁决/出货资格版本与最近一次确认快照一致、结论分别为 RELEASE / SHIPPABLE。
+        任一批次已在其他交接记录中发运即整单拒绝。
+
+        一次 BEGIN IMMEDIATE 事务内完成“读校验 → 写交接主记录/逐批确认快照冻结副本/
+        全单批次占用”：占用全单批次并冻结交接时的单号、修订号、逐批确认快照与交接时间；
+        后续更正、待复核或清单修订一律不改写交接记录。重复交接号、未知单据、状态/版本
+        冲突、任一不合格批次均整体回滚，不留下部分占用。
+        """
+        handover_no = (handover_no or "").strip()
+        verification_no = (verification_no or "").strip()
+        if not handover_no:
+            raise bad_request("INVALID_PAYLOAD", "handover_no 不能为空")
+        if not verification_no:
+            raise bad_request("INVALID_PAYLOAD", "verification_no 不能为空")
+
+        with self.store.write() as conn:
+            # 1) 交接号须唯一
+            if conn.execute(
+                "SELECT 1 FROM shipment_handover WHERE handover_no = ?", (handover_no,)
+            ).fetchone():
+                raise conflict("DUPLICATE_HANDOVER", f"装车交接号已存在: {handover_no}")
+
+            # 2) 单据须存在
+            vrow = conn.execute(
+                "SELECT * FROM verification WHERE verification_no = ?", (verification_no,)
+            ).fetchone()
+            if not vrow:
+                raise not_found(
+                    "VERIFICATION_NOT_FOUND", f"出货核验单不存在: {verification_no}"
+                )
+
+            # 3) 仍为已确认，且读取时修订号匹配
+            if vrow["status"] != "CONFIRMED":
+                raise conflict(
+                    "VERIFICATION_NOT_CONFIRMED",
+                    (
+                        f"出货核验单当前状态为 {vrow['status']}，"
+                        f"交接只接受仍为已确认（CONFIRMED）的单据: {verification_no}"
+                    ),
+                )
+            current_revision = vrow["revision"]
+            if expected_revision != current_revision:
+                raise conflict(
+                    "VERIFICATION_REVISION_CONFLICT",
+                    (
+                        f"修订号不匹配：提交基于 v{expected_revision}，"
+                        f"单据当前修订号为 v{current_revision}；"
+                        "请重新查询单据获取最新修订号后再交接"
+                    ),
+                    [
+                        {
+                            "reason_code": "VERIFICATION_REVISION_CONFLICT",
+                            "submitted_revision": expected_revision,
+                            "current_revision": current_revision,
+                            "message": "交接要求单据仍为已确认且修订号与读取时一致，本次交接整体拒绝",
+                        }
+                    ],
+                )
+
+            # 4) 交接所依据的“最近一次确认”
+            confirmation = conn.execute(
+                """SELECT * FROM verification_confirmation
+                   WHERE verification_no = ? ORDER BY id DESC LIMIT 1""",
+                (verification_no,),
+            ).fetchone()
+            if not confirmation:
+                # CONFIRMED 单据理论上必有确认记录；防御性报错
+                raise conflict(
+                    "VERIFICATION_NOT_CONFIRMED",
+                    "已确认单据缺少确认记录，无法交接",
+                )
+            confirmation_id = confirmation["id"]
+            confirmed_at = confirmation["confirmed_at"]
+
+            # 5) 逐批关联：最近一次确认快照 + 当前裁决/出货资格 + 批次状态 + 是否已占用
+            rows = conn.execute(
+                """SELECT vcb.position AS position, vcb.batch_no AS batch_no,
+                          vcb.snapshot_version AS snap_version,
+                          vcb.snapshot_disposition AS snap_disposition,
+                          vcb.snapshot_actual AS snap_actual,
+                          vcb.snapshot_undeclared AS snap_undeclared,
+                          vcb.snapshot_reasons AS snap_reasons,
+                          vcb.snapshot_ship_version AS snap_ship_version,
+                          vcb.snapshot_ship_status AS snap_ship_status,
+                          vcb.snapshot_locked_lots AS snap_locked_lots,
+                          vcb.snapshot_ship_reasons AS snap_ship_reasons,
+                          b.status AS batch_status,
+                          a.version AS cur_version, a.disposition AS cur_disposition,
+                          a.undeclared AS cur_undeclared,
+                          se.version AS cur_ship_version, se.status AS cur_ship_status,
+                          se.locked_lots AS cur_locked_lots,
+                          ho.handover_no AS occupied_by
+                   FROM verification_confirmation_batch vcb
+                   JOIN batch b ON b.batch_no = vcb.batch_no
+                   LEFT JOIN adjudication a ON a.batch_no = vcb.batch_no
+                   LEFT JOIN shipment_eligibility se ON se.batch_no = vcb.batch_no
+                   LEFT JOIN shipment_handover_occupancy ho ON ho.batch_no = vcb.batch_no
+                   WHERE vcb.confirmation_id = ?
+                   ORDER BY vcb.position""",
+                (confirmation_id,),
+            ).fetchall()
+            if not rows:
+                raise conflict(
+                    "VERIFICATION_NOT_CONFIRMED",
+                    "最近一次确认缺少逐批快照，无法交接",
+                )
+
+            # 6) 占用优先：任一批次已在其他交接记录中发运 -> 整单 409
+            shipped = [
+                {
+                    "batch_no": r["batch_no"],
+                    "position": r["position"],
+                    "reason_code": "BATCH_ALREADY_SHIPPED",
+                    "handover_no": r["occupied_by"],
+                    "message": f"批次已在交接记录 {r['occupied_by']} 中发运，不得重复交接",
+                }
+                for r in rows
+                if r["occupied_by"] is not None
+            ]
+            if shipped:
+                raise conflict(
+                    "BATCH_ALREADY_SHIPPED",
+                    "核验单含已在其他交接记录中发运的批次，整单拒绝交接",
+                    shipped,
+                )
+
+            # 7) 逐批资格：有效、当前裁决/出货资格版本与最近一次确认快照一致、
+            #    结论分别为 RELEASE / SHIPPABLE。任一不合格 -> 整单 422。
+            mismatches: list[dict[str, Any]] = []
+            for r in rows:
+                bn = r["batch_no"]
+                if r["batch_status"] == "VOIDED":
+                    mismatches.append(
+                        {
+                            "batch_no": bn,
+                            "position": r["position"],
+                            "reason_code": "BATCH_VOIDED",
+                            "message": "批次已作废，不能交接发运",
+                        }
+                    )
+                    continue
+
+                # 裁决：版本须与最近一次确认快照一致，结论须 RELEASE
+                if r["cur_version"] is None:
+                    mismatches.append(
+                        {
+                            "batch_no": bn,
+                            "position": r["position"],
+                            "reason_code": "STALE_SNAPSHOT",
+                            "message": "批次缺少当前裁决，无法交接",
+                        }
+                    )
+                else:
+                    if r["cur_version"] != r["snap_version"]:
+                        mismatches.append(
+                            {
+                                "batch_no": bn,
+                                "position": r["position"],
+                                "reason_code": "STALE_SNAPSHOT",
+                                "message": (
+                                    f"当前裁决版本 v{r['cur_version']} 与最近一次确认快照 "
+                                    f"v{r['snap_version']} 不一致（单据须为已确认且无未复核变化）；"
+                                    "请重新核验、重新确认后再交接"
+                                ),
+                                "snapshot_version": r["snap_version"],
+                                "current_version": r["cur_version"],
+                            }
+                        )
+                    if r["cur_disposition"] != "RELEASE":
+                        mismatches.append(
+                            {
+                                "batch_no": bn,
+                                "position": r["position"],
+                                "reason_code": "BATCH_ON_HOLD",
+                                "message": (
+                                    f"批次当前裁决为 {r['cur_disposition']}（非 RELEASE），"
+                                    "不能交接发运"
+                                ),
+                                "snapshot_version": r["snap_version"],
+                                "current_version": r["cur_version"],
+                                "disposition": r["cur_disposition"],
+                                "undeclared_allergens": loads(r["cur_undeclared"] or "[]"),
+                            }
+                        )
+
+                # 出货资格：版本须与最近一次确认快照一致，状态须 SHIPPABLE
+                if r["cur_ship_version"] is None:
+                    mismatches.append(
+                        {
+                            "batch_no": bn,
+                            "position": r["position"],
+                            "reason_code": "STALE_ELIGIBILITY",
+                            "message": "批次缺少当前出货资格，无法交接",
+                        }
+                    )
+                else:
+                    if r["cur_ship_version"] != r["snap_ship_version"]:
+                        mismatches.append(
+                            {
+                                "batch_no": bn,
+                                "position": r["position"],
+                                "reason_code": "STALE_ELIGIBILITY",
+                                "message": (
+                                    f"当前出货资格版本 v{r['cur_ship_version']} 与最近一次确认快照 "
+                                    f"v{r['snap_ship_version']} 不一致；"
+                                    "请重新核验、重新确认后再交接"
+                                ),
+                                "snapshot_version": r["snap_ship_version"],
+                                "current_version": r["cur_ship_version"],
+                            }
+                        )
+                    if r["cur_ship_status"] != "SHIPPABLE":
+                        mismatches.append(
+                            {
+                                "batch_no": bn,
+                                "position": r["position"],
+                                "reason_code": "MATERIAL_LOT_LOCKED",
+                                "message": (
+                                    f"批次当前出货资格为 {r['cur_ship_status']}（非 SHIPPABLE），"
+                                    f"直接使用的待检锁定批号: {'、'.join(loads(r['cur_locked_lots']))}，"
+                                    "不能交接发运"
+                                ),
+                                "snapshot_version": r["snap_ship_version"],
+                                "current_version": r["cur_ship_version"],
+                                "locked_lots": loads(r["cur_locked_lots"]),
+                            }
+                        )
+
+            if mismatches:
+                raise unprocessable(
+                    "HANDOVER_NOT_ALLOWED",
+                    "存在不合格批次，整单不交接；不写入交接记录、不占用任何批次",
+                    mismatches,
+                )
+
+            # 8) 全部校验通过：一次事务内占用全单批次并冻结单号、修订号、
+            #    逐批确认快照与交接时间
+            now = _now()
+            conn.execute(
+                """INSERT INTO shipment_handover
+                   (handover_no, verification_no, verification_revision, confirmation_id,
+                    confirmed_at, batch_count, handed_over_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    handover_no,
+                    verification_no,
+                    current_revision,
+                    confirmation_id,
+                    confirmed_at,
+                    len(rows),
+                    now,
+                ),
+            )
+            conn.executemany(
+                """INSERT INTO shipment_handover_batch
+                   (handover_no, position, batch_no, confirmation_id, snapshot_version,
+                    snapshot_disposition, snapshot_actual, snapshot_undeclared, snapshot_reasons,
+                    snapshot_ship_version, snapshot_ship_status,
+                    snapshot_locked_lots, snapshot_ship_reasons)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                [
+                    (
+                        handover_no,
+                        r["position"],
+                        r["batch_no"],
+                        confirmation_id,
+                        r["snap_version"],
+                        r["snap_disposition"],
+                        r["snap_actual"],
+                        r["snap_undeclared"],
+                        r["snap_reasons"],
+                        r["snap_ship_version"],
+                        r["snap_ship_status"],
+                        r["snap_locked_lots"],
+                        r["snap_ship_reasons"],
+                    )
+                    for r in rows
+                ],
+            )
+            conn.executemany(
+                """INSERT INTO shipment_handover_occupancy
+                   (batch_no, handover_no, position, handed_over_at)
+                   VALUES (?, ?, ?, ?)""",
+                [(r["batch_no"], handover_no, r["position"], now) for r in rows],
+            )
+
+            hrow = conn.execute(
+                "SELECT * FROM shipment_handover WHERE handover_no = ?", (handover_no,)
+            ).fetchone()
+            return _handover_payload(conn, hrow)
+
+    def list_handovers(self, verification_no: str | None = None) -> dict[str, Any]:
+        """列出装车交接记录（可按核验单号过滤），按交接时间排序。"""
+        with self.store.read() as conn:
+            if verification_no:
+                rows = conn.execute(
+                    """SELECT * FROM shipment_handover WHERE verification_no = ?
+                       ORDER BY handed_over_at, handover_no""",
+                    (verification_no,),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM shipment_handover ORDER BY handed_over_at, handover_no"
+                ).fetchall()
+            return {"handovers": [_handover_summary(conn, r) for r in rows]}
+
+    def get_handover(self, handover_no: str) -> dict[str, Any]:
+        """查询单次装车交接：冻结的单号/修订号/确认引用/交接时间与逐批确认快照。"""
+        with self.store.read() as conn:
+            row = conn.execute(
+                "SELECT * FROM shipment_handover WHERE handover_no = ?", (handover_no,)
+            ).fetchone()
+            if not row:
+                raise not_found("HANDOVER_NOT_FOUND", f"装车交接记录不存在: {handover_no}")
+            return _handover_payload(conn, row)
+
+    def get_batch_handover(self, batch_no: str) -> dict[str, Any]:
+        """追溯单批的交接归属：未发运返回 shipped=false；未知批次 404。"""
+        with self.store.read() as conn:
+            if not conn.execute(
+                "SELECT 1 FROM batch WHERE batch_no = ?", (batch_no,)
+            ).fetchone():
+                raise not_found("BATCH_NOT_FOUND", f"批次不存在: {batch_no}")
+            occ = conn.execute(
+                """SELECT ho.handover_no AS handover_no, ho.verification_no AS verification_no,
+                          ho.verification_revision AS verification_revision,
+                          ho.confirmation_id AS confirmation_id,
+                          ho.confirmed_at AS confirmed_at,
+                          ho.handed_over_at AS handed_over_at,
+                          oc.position AS position
+                   FROM shipment_handover_occupancy oc
+                   JOIN shipment_handover ho ON ho.handover_no = oc.handover_no
+                   WHERE oc.batch_no = ?""",
+                (batch_no,),
+            ).fetchone()
+            if occ is None:
+                return {"batch_no": batch_no, "shipped": False, "handover": None}
+            return {
+                "batch_no": batch_no,
+                "shipped": True,
+                "handover": {
+                    "handover_no": occ["handover_no"],
+                    "verification_no": occ["verification_no"],
+                    "verification_revision": occ["verification_revision"],
+                    "confirmation_id": occ["confirmation_id"],
+                    "position": occ["position"],
+                    "confirmed_at": occ["confirmed_at"],
+                    "handed_over_at": occ["handed_over_at"],
+                },
+            }
+
 
 # ---------------------------------------------------------------- 出货核验单
 
@@ -2398,3 +2757,76 @@ def _refresh_snapshots(
             "UPDATE verification SET revision = revision + 1 WHERE verification_no=?",
             (verification_no,),
         )
+
+
+# ---------------------------------------------------------------- 装车交接序列化
+
+
+def _handover_batches(conn, handover_no: str) -> list[dict[str, Any]]:
+    """交接记录中逐批冻结的确认快照（不可变副本）。"""
+    rows = conn.execute(
+        """SELECT position, batch_no, confirmation_id, snapshot_version,
+                  snapshot_disposition, snapshot_actual, snapshot_undeclared, snapshot_reasons,
+                  snapshot_ship_version, snapshot_ship_status,
+                  snapshot_locked_lots, snapshot_ship_reasons
+           FROM shipment_handover_batch
+           WHERE handover_no = ? ORDER BY position""",
+        (handover_no,),
+    ).fetchall()
+    return [
+        {
+            "position": r["position"],
+            "batch_no": r["batch_no"],
+            "confirmation_id": r["confirmation_id"],
+            "adjudication": {
+                "version": r["snapshot_version"],
+                "disposition": r["snapshot_disposition"],
+                "actual_allergens": loads(r["snapshot_actual"]),
+                "undeclared_allergens": loads(r["snapshot_undeclared"]),
+                "reasons": loads(r["snapshot_reasons"]),
+            },
+            "shipment_eligibility": {
+                "version": r["snapshot_ship_version"],
+                "status": r["snapshot_ship_status"],
+                "locked_lots": loads(r["snapshot_locked_lots"]),
+                "reasons": loads(r["snapshot_ship_reasons"]),
+            },
+        }
+        for r in rows
+    ]
+
+
+def _handover_payload(conn, row) -> dict[str, Any]:
+    """单次交接完整负载：冻结的单号/修订号/确认引用/交接时间 + 逐批确认快照。"""
+    return {
+        "handover_no": row["handover_no"],
+        "verification_no": row["verification_no"],
+        "verification_revision": row["verification_revision"],
+        "confirmation_id": row["confirmation_id"],
+        "confirmed_at": row["confirmed_at"],
+        "batch_count": row["batch_count"],
+        "handed_over_at": row["handed_over_at"],
+        "batches": _handover_batches(conn, row["handover_no"]),
+    }
+
+
+def _handover_summary(conn, row) -> dict[str, Any]:
+    """交接列表项：不含逐批快照详情，仅成员顺序/批号。"""
+    members = [
+        {"position": r["position"], "batch_no": r["batch_no"]}
+        for r in conn.execute(
+            """SELECT position, batch_no FROM shipment_handover_batch
+               WHERE handover_no = ? ORDER BY position""",
+            (row["handover_no"],),
+        ).fetchall()
+    ]
+    return {
+        "handover_no": row["handover_no"],
+        "verification_no": row["verification_no"],
+        "verification_revision": row["verification_revision"],
+        "confirmation_id": row["confirmation_id"],
+        "confirmed_at": row["confirmed_at"],
+        "batch_count": row["batch_count"],
+        "handed_over_at": row["handed_over_at"],
+        "batches": members,
+    }

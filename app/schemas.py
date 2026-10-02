@@ -64,3 +64,13 @@ class VerificationReviseIn(BaseModel):
         min_length=1,
         description="修订后的完整批次号新清单：非空、不可重复、批次须全部存在且有效（ACTIVE），按提交顺序保存",
     )
+
+
+class HandoverIn(BaseModel):
+    handover_no: str = Field(..., description="装车交接号（唯一）；重复交接号整体拒绝")
+    verification_no: str = Field(..., description="已确认的出货核验单号")
+    expected_revision: int = Field(
+        ...,
+        ge=1,
+        description="工作人员所见单据修订号（读取时修订号，乐观并发）；交接仅接受仍为 CONFIRMED 且修订号匹配的单据，否则整体拒绝（VERIFICATION_REVISION_CONFLICT）",
+    )

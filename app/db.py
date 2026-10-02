@@ -196,6 +196,56 @@ CREATE TABLE IF NOT EXISTS verification_confirmation_batch (
 
 CREATE INDEX IF NOT EXISTS idx_vcb_confirmation
     ON verification_confirmation_batch(confirmation_id);
+
+-- 装车交接（整单发运）：凭唯一交接号对一张“仍为已确认且修订号匹配”的出货核验单
+-- 登记整单发运。交接记录只追加、不可变——后续更正、待复核或清单修订一律不改写它。
+CREATE TABLE IF NOT EXISTS shipment_handover (
+    handover_no           TEXT PRIMARY KEY,
+    verification_no       TEXT NOT NULL REFERENCES verification(verification_no),
+    -- 交接时冻结的单号与修订号：之后单据修订号再推进也不影响本记录
+    verification_revision INTEGER NOT NULL,
+    -- 交接所依据的“最近一次确认”
+    confirmation_id       INTEGER NOT NULL REFERENCES verification_confirmation(id),
+    confirmed_at          TEXT NOT NULL,
+    batch_count           INTEGER NOT NULL,
+    handed_over_at        TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_handover_verification
+    ON shipment_handover(verification_no);
+
+-- 交接时逐批冻结的“最近一次确认快照”不可变副本（裁决版本/结论 + 出货资格版本/状态）。
+-- 交接要求当前裁决/出货资格版本与之一致且结论分别为 RELEASE / SHIPPABLE。
+CREATE TABLE IF NOT EXISTS shipment_handover_batch (
+    handover_no           TEXT NOT NULL REFERENCES shipment_handover(handover_no),
+    position              INTEGER NOT NULL,      -- 按确认清单顺序保序
+    batch_no              TEXT NOT NULL REFERENCES batch(batch_no),
+    confirmation_id       INTEGER NOT NULL REFERENCES verification_confirmation(id),
+    snapshot_version      INTEGER NOT NULL,
+    snapshot_disposition  TEXT NOT NULL,         -- RELEASE / HOLD
+    snapshot_actual       TEXT NOT NULL DEFAULT '[]',
+    snapshot_undeclared   TEXT NOT NULL DEFAULT '[]',
+    snapshot_reasons      TEXT NOT NULL DEFAULT '[]',
+    snapshot_ship_version INTEGER NOT NULL,
+    snapshot_ship_status  TEXT NOT NULL,         -- SHIPPABLE / BLOCKED
+    snapshot_locked_lots  TEXT NOT NULL DEFAULT '[]',
+    snapshot_ship_reasons TEXT NOT NULL DEFAULT '[]',
+    PRIMARY KEY (handover_no, batch_no)
+);
+
+CREATE INDEX IF NOT EXISTS idx_hbatch_batch ON shipment_handover_batch(batch_no);
+
+-- 每批全局唯一的“已发运”占用：一旦在某交接记录中发运，即不可再被任何交接占用。
+-- PRIMARY KEY(batch_no) 在数据库层兜底“任一批次已在其他交接记录中发运则整单拒绝”。
+CREATE TABLE IF NOT EXISTS shipment_handover_occupancy (
+    batch_no       TEXT PRIMARY KEY REFERENCES batch(batch_no),
+    handover_no    TEXT NOT NULL REFERENCES shipment_handover(handover_no),
+    position       INTEGER NOT NULL,
+    handed_over_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_hoccupancy_handover
+    ON shipment_handover_occupancy(handover_no);
 """
 
 # 初始化空库时写入的参考原料批号（不影响裁决的演示样例）
